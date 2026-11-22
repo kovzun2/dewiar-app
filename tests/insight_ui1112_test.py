@@ -92,7 +92,9 @@ EMPTY = {"insight_pulse": {"stats": dict(R["insight_pulse"]["stats"], sources_al
 def run(lang, data):
     core = """(() => { const R = %s; const ready = () => { if (!window.core) return setTimeout(ready, 5);
     core.retry = () => {}; core.connect = () => {}; if (core.ws) { core.ws.onclose = null; core.ws.onerror = null; try { core.ws.close(); } catch (e) {} }
-    window.radarQuestions = []; core.connected = true; core.call = async (c, a) => { if (c === 'insight_question') {
+    window.radarQuestions = []; core.connected = true;
+    const sendLater = core.sendLater.bind(core); core.sendLater = async (c, a) => { if (c === 'say') { window.radarDial = a; return; } return sendLater(c, a); };
+    core.call = async (c, a) => { if (c === 'insight_question') {
       radarQuestions.push(a); if (a.expert && R.insight_question) return { ...R.insight_question, expert: R.insight_pulse?.expert?.name }; }
     return c in R ? R[c] : null; }; }; ready(); })();""" % json.dumps(data, ensure_ascii=False)
     out = {}
@@ -124,17 +126,72 @@ def run(lang, data):
         out["ans"] = pg.evaluate("(document.querySelector('#rd-ans') || {}).innerText || ''")
         out["refs"] = pg.evaluate("document.querySelectorAll('#rd-ans .rd-ref').length")
         if data is R:
-            pg.evaluate("window.qaAsk = q => { window.radarDial = q; }")
+            pg.locator('.rd-sg[data-ask="radar"]').nth(1).click()
+            pg.wait_for_function("radarQuestions.length === 2 && document.querySelector('#rd-achat')")
+            pg.locator('.rd-sg[data-ask="expert"]').first.click()
+            pg.wait_for_function("radarQuestions.length === 3 && document.querySelector('#rd-achat')")
+            out["routes"] = pg.evaluate("radarQuestions.map(a => !!a.expert)")
             pg.click("#rd-achat")
-            out["callExpert"] = pg.evaluate("window.radarDial")
+            pg.wait_for_function("!!window.radarDial")
+            out["callExpert"] = pg.evaluate("window.radarDial.text")
+            pg.evaluate("document.querySelector('nav button[data-p=insight]').click()")
             pg.fill("#rd-ask-q", "Какие риски?"); pg.press("#rd-ask-q", "Enter")
-            pg.wait_for_function("radarQuestions.length === 2")
-            out["followup"] = pg.evaluate("radarQuestions[1]")
+            pg.wait_for_function("radarQuestions.length === 4")
+            out["followup"] = pg.evaluate("radarQuestions[3]")
         out["askbar"] = pg.evaluate("!!document.querySelector('form.rd-ask')")
         out["head"] = pg.evaluate("document.querySelector('#rd-room').innerText")
         out["errs"] = [e for e in errs if "insight" in e]
         b.close()
     return out
+
+
+def chat_tool(text, mode):
+    from queue import Queue
+    from unittest.mock import patch
+    from engine_answer import AnswerMixin
+    from engine_base import Turn
+    from tools import TOOLS
+    from tools_docs import t_insight_ask
+
+    calls = []
+    desc, schema = TOOLS["insight_ask"][:2]
+    spec = {"name": "insight_ask", "description": desc, "parameters": schema}
+    turn = Turn(1)
+    chat = AnswerMixin()
+    chat.s, chat.history, chat.insight = S(), [], eng.insight
+    chat.s.d = dict(eng.s.d, llm={"tools_modes": {"mock": mode}})
+    if mode == "slow":
+        chat._tools_slow = {"mock": time.monotonic()}
+    chat.toolbox = types.SimpleNamespace(specs=lambda *_a, **_kw: [spec])
+    chat._messages = lambda text, *_: [{"role": "user", "content": text}]
+    chat._tools_key = lambda _: "mock"
+    chat._profile_in_msgs = lambda _: False
+    chat._system = lambda *a, **kw: "Ты помощник."
+    chat._kb_persona_quiet = lambda _: True
+    chat._fit_window = lambda _, system, specs, msgs, **kw: (system, specs, msgs)
+    chat.memory_for = lambda _: ("", [])
+    chat.persona_gender = lambda: "f"
+    chat._blind = set()
+    for name in ("probe_tools_bg", "_turn_context", "_plugin_hint", "_persona_knowledge", "emit", "health_count",
+                 "agenda_context", "care_context", "_usage_note", "_slow_local", "_coder_brain", "_act_cue_arm",
+                 "set_state", "_early_done", "_fake_reminder", "_sources_done", "_maybe_learn"):
+        setattr(chat, name, lambda *a, **kw: "")
+
+    def use_tool(turn, call, sentences):
+        calls.append((call["name"], call["args"]))
+        return t_insight_ask(call["args"], {"engine": eng})
+
+    chat._use_tool = use_tool
+
+    def model(prof, system, messages, **kw):
+        assert calls, "ядро должно передать вопрос эксперту до вызова чат-модели"
+        assert '"expert":' in str(messages[-1]["content"])
+        yield "text", "Ответ эксперта получен."
+
+    with patch("engine_answer.stream_events", model):
+        prepared = chat._turn_prepare(turn, text, (), {"kind": "openai", "model": "mock", "tools_mode": mode})
+        chat._turn_steps(turn, text, (), Queue(), *prepared)
+    return calls
 
 
 results = {}
@@ -157,7 +214,12 @@ ok("Главное за неделю" in ru["ans"] and ru["refs"] == 2 and ru["a
    f"«Спросите Лиру о теме»: готовый вопрос — ответ здесь же, ссылки на материалы; старой строки внизу нет: {ru['ans'][:120]!r}")
 ok("Continue in chat" in en["ans"], "ответ и по-английски — с переходом в чат")
 ok("Мира" in ru["pulse"] and "$1 200 за июнь" in ru["mind"], "профиль и изученные кейсы видны в Студии")
+ok(ru["routes"] == en["routes"] == [False, False, True], "сводку и тренды спрашиваем у Лиры, кейсы — у эксперта")
 ok((ru["callExpert"] or "").startswith("Спроси эксперта Радара"), "из Студии вопрос эксперту передаётся в чат Лиры")
+for lang, mode in (("ru", "native"), ("en", "prompt"), ("ru", "none"), ("ru", "slow")):
+    text = results[lang]["callExpert"]
+    ok(chat_tool(text, mode) == [("insight_ask", {"query": text.split(":", 1)[1].strip(), "expert": True})],
+       f"{lang}: кнопка вызывает эксперта через чат ({mode})")
 ok(ru["followup"].get("expert") and (ru["followup"].get("history") or [{}])[0].get("q"),
    "уточнение передаётся эксперту с предыдущим вопросом и ответом")
 e = run("ru", EMPTY)

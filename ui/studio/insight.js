@@ -83,7 +83,7 @@
     }
     chips(d.stats);
     if (!d.stats.sources_all) {
-      el.innerHTML = empty(T("empty.title"), T("empty.text"), T("empty.btn")) + (d.expert?.cases ? askCard([], d.expert) : "");
+      el.innerHTML = empty(T("empty.title"), T("empty.text"), T("empty.btn")) + (d.expert?.cases ? askCard(null, d.expert) : "");
       bindGo(el); bindAsk(el); return;
     }
     const b = d.brief && d.brief.headline ? d.brief : null;
@@ -118,13 +118,15 @@
   }
   function askCard(tr, expert) {
     const up = (tr || []).find(t => t.status === "up" || t.status === "new");
-    const sug = [T("ask.s1"), up ? T("ask.s2", { t: up.name }) : T("ask.s2b"), T("ask.s3")];
+    const pulse = tr ? [T("ask.s1"), up ? T("ask.s2", { t: up.name }) : T("ask.s2b")] : [];
+    const suggestions = (items, mode) => items.map(x => `<button type="button" class="rd-sg" data-ask="${mode}">${esc(x)}</button>`).join("");
     return `<div class="rd-card rd-askc"><h3>${esc(expert?.name || T("ask.title"))}</h3><p class="rd-hint">${esc(T("ask.hint"))}</p>
       ${expert ? `<p class="rd-hint">${esc(RD.mission ? progress(expert) : T("expert.no_mission"))}
         <button class="rd-achat" data-go="mind" type="button">${esc(T("expert.memory"))}</button></p>` : ""}
       <form class="rd-askf" id="rd-askf"><input type="text" id="rd-ask-q" maxlength="500" placeholder="${esc(T("ask.ph"))}" aria-label="${esc(T("ask.title"))}">
         <button class="btn primary" type="submit" title="${esc(T("ask.btn"))}" aria-label="${esc(T("ask.btn"))}">${IC_SEND}</button></form>
-      <div class="rd-sugg">${sug.map(x => `<button type="button" class="rd-sg">${esc(x)}</button>`).join("")}</div>
+      ${pulse.length ? `<div class="rd-sugg" aria-label="${esc(T("ask.pulse"))}" role="group">${suggestions(pulse, "radar")}</div>` : ""}
+      <div class="rd-sugg" aria-label="${esc(T("ask.title"))}" role="group">${suggestions([T("expert.compare"), T("expert.idea")], "expert")}</div>
       <div id="rd-ask-history">${historyHtml()}</div>
       <div class="rd-ans" id="rd-ans" aria-live="polite">${RD.ans ? ansHtml(RD.ans) : ""}</div></div>`;
   }
@@ -135,7 +137,7 @@
         `<a href="#" data-url="${esc(r.url)}">${esc(r.title)}</a>`).join(" · ")}`).join("")}</details>`;
   }
   function ansHtml(a) {
-    if (a.wait) return `<div class="rd-wait"><i></i><i></i><i></i><span>${esc(T("ask.wait"))}</span></div>`;
+    if (a.wait) return `<div class="rd-wait"><i></i><i></i><i></i><span>${esc(T(a.expert ? "expert.wait" : "ask.wait"))}</span></div>`;
     if (a.err) return `<p class="rd-aerr">${esc(a.err)}</p>`;
     // владелец 14.11: «как каша — сложно читать»: главное крупно, пункты с темой, «→ что сделать» отдельно
     const refs = (h) => h.replace(/\s*\[(\d{1,2})\]([.,;:!?)]?)/g, (m, n, p) => `<span class="rd-refw">\u00a0<a href="#" class="rd-ref" data-ref="${n}">${n}</a>${p}</span>`);
@@ -162,7 +164,7 @@
     if (RD.ans?.text && RD.ans.expert) RD.turns = [...RD.turns, RD.ans].slice(-3);
     const history = q("#rd-ask-history");
     if (history) { history.innerHTML = historyHtml(); bindAnswerLinks(history); }
-    const pending = RD.ans = { q: v, wait: true };
+    const pending = RD.ans = { q: v, wait: true, expert };
     if (box()) box().innerHTML = ansHtml(pending);
     let answer;
     try { answer = await call("insight_question", expert ? { q: v, expert, history: RD.turns.map(a => ({ q: a.q, a: a.text })) } : { q: v }); }
@@ -182,7 +184,7 @@
   function bindAsk(el) {
     const f = q("#rd-askf", el); if (!f) return;
     f.onsubmit = (e) => { e.preventDefault(); const i = q("#rd-ask-q"); const v = i.value.trim(); if (!v) { i.focus(); return; } i.value = ""; askNow(v); };
-    qa(".rd-sg", el).forEach(b => b.onclick = () => askNow(b.textContent));
+    qa(".rd-sg", el).forEach(b => b.onclick = () => askNow(b.textContent, b.dataset.ask === "expert"));
     bindAnswerLinks(q("#rd-ask-history", el));
     bindAns(q("#rd-ans", el));
   }

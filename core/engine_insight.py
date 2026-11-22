@@ -305,6 +305,8 @@ class Radar:
                 a = None
             if not x.get("a"):
                 self.st.set_analysis(x["id"], a, fail="" if a else "модель не ответила по форме")
+            elif mission and a is None:
+                Expert.remember(self.st, mission, x, None, [])
             n += 1
         if n:
             self._count(n)
@@ -529,13 +531,16 @@ class Radar:
     def expert_name(self):
         return self.conf().get("expert_name") or ("Radar expert" if self.lang().startswith("en") else "Эксперт Радара")
 
-    def expert_address(self, text):
-        name = self.conf().get("expert_name")
+    def expert_query(self, text):
+        text = (text or "").strip()
+        prompt = r"(?:спроси(?:те)?\s+эксперта\s+радара|ask\s+(?:the\s+)?radar\s+expert)"
+        match = re.match(rf"^{prompt}(?:\s*[,:—]\s*|\s+)", text, re.IGNORECASE)
+        if match:
+            return text[match.end():].strip()
         # Распознавание речи не всегда ставит запятую между именем и вопросом.
-        address = r"(?:\s*[,:—]|\s+(?:как|что|предложи|подскажи|what|how|suggest)\b)"
-        if name and re.match(rf"^\s*@?{re.escape(name)}{address}", text or "", re.IGNORECASE):
-            return name
-        return ""
+        address = r"(?:\s*[,:—]\s*|\s+(?=(?:как|что|предложи|подскажи|what|how|suggest)\b))"
+        match = re.match(rf"^@?{re.escape(self.expert_name())}{address}", text, re.IGNORECASE)
+        return text[match.end():].strip() if match else ""
 
     def expert_profile(self, *, recent=False):
         rows = Expert.records(self.st, self.conf()["mission"], self.st.items())
@@ -705,7 +710,7 @@ def question(eng, q, *, expert=False, history=None):
         name = r.expert_name()
         items = r.st.items()
         rows = Expert.records(r.st, mission, items)
-        turns = [{"q": str(turn.get("q") or "")[:500], "a": str(turn.get("a") or "")[:1000]}
+        turns = [{"q": str(turn.get("q") or "")[:500], "a": re.sub(r"[ \t]*\[\d{1,2}\]", "", str(turn.get("a") or ""))[:1000]}
                  for turn in (history[-3:] if isinstance(history, list) else []) if isinstance(turn, dict)]
         search = q + (" " + turns[-1]["q"] if turns else "")
         ctx = Expert.answer_context(rows, items, search, mission, lang)
@@ -724,7 +729,7 @@ def question(eng, q, *, expert=False, history=None):
             raise ValueError("Радар ещё ничего не разобрал — загляните после первого обхода")
     raw = r._ask(*I.question_prompt(q, ctx, mission, lang, expert=name, history=turns),
                  max_tokens=950 if expert else 700)
-    out = I.parse_answer(raw, ctx)
+    out = I.parse_answer(raw, ctx, max_length=6000 if expert else 3000)
     if not out["text"]:
         raise ValueError("модель не ответила — попробуйте ещё раз")
     if name:

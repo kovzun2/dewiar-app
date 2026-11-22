@@ -407,9 +407,9 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
             # харнесс, шаг 1 (15.11): к вопросу — ядро действий и только нужные модули (Toolbox.specs(text)); прочее модель
             # попросит сама (more_tools) — вопрос легче вдвое: окно своей модели, свой ключ, очередь облака
             current_ask = ask_core(text)
-            expert_address = getattr(getattr(self, "insight", None), "expert_address", None)
-            expert = expert_address(current_ask) if expert_address else ""
-            routing_text = current_ask + ("\nРадар" if expert else "")
+            expert_query = getattr(getattr(self, "insight", None), "expert_query", None)
+            radar_question = expert_query(ask0) if expert_query else ""
+            routing_text = current_ask + ("\nРадар" if radar_question else "")
             slim_text = routing_text + "\n" + "\n".join(
                 str(m.get("content") or "")[:300] for m in self.history[-4:] if m.get("role") == "user" and isinstance(m.get("content"), str))
             specs = self.toolbox.specs(slim_text) if self.s.get("tools", "enabled_all") is not False else []
@@ -423,6 +423,8 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                 # «С возвращением» — по готовым фактам, без инструментов (владелец 20.11: вечером позвала done_report — и в итог
                 # попали «обед с картой», «серия» и «всего 65 дел»; поручение «без инструментов» модель не держала)
                 specs = []
+            # Разрешение пользователя проверяем до ограничения действий по возможностям модели.
+            turn.radar_question = radar_question if any(spec.get("name") == "insight_ask" for spec in specs) else ""
             turn.lean = False
             # переключатель — llm.talk_lean (стенд: llm.talk_lean=false — как раньше)
             tl_ = self.s.get("llm", "talk_lean")
@@ -478,8 +480,6 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
             except Exception as e:  # noqa: BLE001
                 log.info("Поиск по записям: %s", e)
             ctx = [self._turn_context(text)] + ([pdelta] if pdelta else []) + [n.strip() for n in notes]   # меняющееся — в справку к вопросу, подсказка остаётся прежней
-            if expert and any(spec.get("name") == "insight_ask" for spec in specs):
-                ctx.append(f"Человек обращается к эксперту Радара по имени «{expert}». Передай вопрос в insight_ask с expert=true.")
             turn.read = read_mode(text, getattr(turn, "typed", False))
             if turn.read:
                 ctx.append(READ_HINT)                  # длинный разбор — для чтения: подзаголовки, жирное, списки
@@ -563,11 +563,16 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                         ctx.append(gh)
                 except Exception:  # noqa: BLE001
                     pass
+            if turn.radar_question:
+                ctx.append("Человек обращается к эксперту Радара. Передай его ответ из text, назови автора из expert и сохрани ссылки из refs.")
             msgs = _put_context(msgs, "\n\n".join(c for c in ctx if c))
             if personal:
                 from llm import put_profile
                 msgs = put_profile(msgs, personal)
-            system, specs, msgs = self._fit_window(prof, system, specs, msgs, keep=self._plugin_keep(text), personal=not pmsg)
+            keep = set(self._plugin_keep(text))
+            if turn.radar_question:
+                keep.add("insight_ask")
+            system, specs, msgs = self._fit_window(prof, system, specs, msgs, keep=keep, personal=not pmsg)
             self._pparts = prompt_parts(system, specs, msgs, personal if personal else "", "\n\n".join(c for c in ctx if c))
             try:
                 import xray
@@ -704,6 +709,7 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
             for step in range(6):                       # модель → действия → результаты → модель…
                 calls, step_text = [], ""
                 t_step, t_ev = time.monotonic(), None     # «⏱ модель: …» — от запроса до первого события этого шага
+                radar_question = getattr(turn, "radar_question", "") if step == 0 else ""
                 if step and getattr(turn, "lean", False) and msgs and msgs[-1].get("role") == "user":
                     # «Чистый разговор», а проверка ответа попросила переделать (вызвать плагин, действие, поиск…) — переделывать
                     # уже с полной подсказкой и всеми действиями: налегке их нет (полный прогон 22.11: «полнолуние» — плагин «Луна»)
@@ -731,9 +737,14 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                     # с картинкой ответ сначала собираем целиком: если модель её не примет — повторим без неё;
                     # без картинки ждём только первое событие — ошибка сервера всплывёт здесь, до первого слова
                     try:
-                        events = list(stream_events(prof, system, msgs, cancel=turn.cancel, tools=specs or None)) \
-                            if _has_images(msgs) else _first_then_stream(
-                                stream_events(prof, system, msgs, cancel=turn.cancel, tools=specs or None))
+                        if radar_question:
+                            # Явную просьбу передаём эксперту через обычный исполнитель инструментов.
+                            events = [("tools", [{"id": f"call_radar_{turn.n}", "name": "insight_ask",
+                                                 "args": {"query": radar_question[:500], "expert": True}}])]
+                        else:
+                            events = list(stream_events(prof, system, msgs, cancel=turn.cancel, tools=specs or None)) \
+                                if _has_images(msgs) else _first_then_stream(
+                                    stream_events(prof, system, msgs, cancel=turn.cancel, tools=specs or None))
                     except LLMError as e0:
                         if econ_main is None or step or turn.full or turn.cancel.is_set():
                             raise
@@ -880,16 +891,17 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                         last = time.monotonic()
                     for s_ in split.feed(codef.feed(val)):         # код и команды вслух не читаем
                         say(s_)
-                self._usage_note(prof, (t_ev or time.monotonic()) - t_step, turn)
-                from llm import last_served, served_label
-                sv_ = served_label(last_served())
-                if sv_ and sv_ not in turn.__dict__.setdefault("brains", []):
-                    turn.brains.append(sv_)                  # кто ответил на этом шаге на самом деле (облако Dewiar)
-                    log.info("🧠 Ответил %s", sv_)
-                    xr_m = (xray_current() or {}).get("model")
-                    if isinstance(xr_m, dict):
-                        xr_m["served"] = " → ".join(turn.brains)
-                        xr_m["srv"] = re.sub(r"[^a-z0-9]", "", str((last_served() or {}).get("srv") or ""))[:8]   # для замера по мозгам
+                if not radar_question:
+                    self._usage_note(prof, (t_ev or time.monotonic()) - t_step, turn)
+                    from llm import last_served, served_label
+                    sv_ = served_label(last_served())
+                    if sv_ and sv_ not in turn.__dict__.setdefault("brains", []):
+                        turn.brains.append(sv_)                  # кто ответил на этом шаге на самом деле (облако Dewiar)
+                        log.info("🧠 Ответил %s", sv_)
+                        xr_m = (xray_current() or {}).get("model")
+                        if isinstance(xr_m, dict):
+                            xr_m["served"] = " → ".join(turn.brains)
+                            xr_m["srv"] = re.sub(r"[^a-z0-9]", "", str((last_served() or {}).get("srv") or ""))[:8]   # для замера по мозгам
                 if probing and probe and not ack_seen and ack_again(turn.full, probe, fin=True):
                     probe = probe[ack_again(turn.full, probe, fin=True):]       # «Записала.» и всё — уже сказано
                 if probing and probe and not repeat_head(turn.full, probe, fin=True):   # короткий новый хвост — не терять
@@ -917,7 +929,7 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                     held.clear()
                 called |= {c.get("name") for c in calls}
                 from llm import last_net
-                if last_net():
+                if not radar_question and last_net():
                     turn.net = True                     # ответ этого шага дал узел «Сети Лиры» — пометка в истории
                 if not calls and not turn.cancel.is_set() and specs and step < 5:
                     # «сейчас посмотрю и расскажу» — и ни одного действия; или просили презентацию, а задача не запущена
@@ -1152,7 +1164,13 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                 if any(c.get("name") == "start_task" and not str(r).startswith(("Ошибка", "Инструмент")) for c, r in zip(calls, results)):
                     specs = []                          # задача запущена — делает она; в разговоре только сказать, что взялся
                     log.info("🧵 Задача запущена — в разговоре дальше без действий")
-                msgs = msgs + tool_turn_messages(prof, step_text, calls, results)
+                if radar_question and "insight_ask" not in names0:
+                    # Модель без инструментов получает уже готовый результат обычным текстом.
+                    msgs = _put_context(msgs, "Результат вызова эксперта Радара:\n" + str(results[0]))
+                else:
+                    msgs = msgs + tool_turn_messages(prof, step_text, calls, results)
+                    if radar_question:
+                        specs = [spec for spec in specs if spec.get("name") != "insight_ask"]
                 if turn.full.strip() and not turn.full.endswith(" "):
                     turn.full += " "
                 self.set_state("thinking")

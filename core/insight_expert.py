@@ -8,7 +8,7 @@ import insight as I
 
 TEXT_MAX = 12000
 STUDIES_MAX = 6000
-READ_RETRIES = (6 * 3600, 24 * 3600)
+STUDY_RETRIES = (6 * 3600, 24 * 3600)
 KINDS = ("audience", "problem", "product", "pricing", "revenue", "acquisition", "outcome", "other")
 
 
@@ -56,13 +56,19 @@ def remember(store, mission, item, analysis, findings, *, partial=False):
     with store.lock:
         records = store.load(key, {})
         prior = records.get(item["id"], {})
-        legacy_date = item.get("ts") if item.get("kind") != "article" and item.get("ts") != item.get("seen") else 0
-        row = {"id": item["id"], "url": item.get("url"), "title": item["title"], "source": item.get("src_name"),
-               "ts": item.get("published", legacy_date), "at": int(time.time()), "signal": analysis.get("signal", 0),
-               "findings": findings or (prior.get("findings", []) if partial else [])}
+        now = int(time.time())
+        if analysis is None:
+            # Сбой модели отмечаем отдельно от старого разбора и уже сохранённых цитат.
+            row = dict(prior) if prior else {"id": item["id"], "at": now, "findings": [], "failed": True}
+            row.pop("retry_at", None)
+        else:
+            legacy_date = item.get("ts") if item.get("kind") != "article" and item.get("ts") != item.get("seen") else 0
+            row = {"id": item["id"], "url": item.get("url"), "title": item["title"], "source": item.get("src_name"),
+                   "ts": item.get("published", legacy_date), "at": now, "signal": analysis.get("signal", 0),
+                   "findings": findings or (prior.get("findings", []) if partial else [])}
         retries = prior.get("retries", 0)
-        if partial and retries < len(READ_RETRIES):
-            row.update(retry_at=row["at"] + READ_RETRIES[retries], retries=retries + 1)
+        if (partial or analysis is None) and retries < len(STUDY_RETRIES):
+            row.update(retry_at=now + STUDY_RETRIES[retries], retries=retries + 1)
         records[item["id"]] = row
         if len(records) > STUDIES_MAX:
             # При нехватке места сначала убираем самые старые записи без подтверждённых наблюдений.
@@ -73,7 +79,7 @@ def remember(store, mission, item, analysis, findings, *, partial=False):
 
 def records(store, mission, items):
     excluded = {item["id"] for item in items if item.get("fb") == -1} | set(store.load("expert_excluded", {}))
-    return [row for key, row in store.load(memory_key(mission), {}).items() if key not in excluded] if mission else []
+    return [row for key, row in store.load(memory_key(mission), {}).items() if key not in excluded and not row.get("failed")] if mission else []
 
 
 def mark(store, iid, fb):

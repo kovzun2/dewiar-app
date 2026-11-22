@@ -806,23 +806,18 @@ def structure_answer(text):
     return lead + "\n" + "\n".join("• " + x for x in pts)
 
 
-def parse_answer(raw, ctx):
+def parse_answer(raw, ctx, *, max_length=3000):
     """Ответ модели -> {text, refs}: без размышлений; [n] — только существующие материалы (выдуманные номера убираются)."""
     text = re.sub(r"<think>.*?</think>", "", raw or "", flags=re.S).strip()
     text = re.sub(r"\*\*|__|^#+\s*", "", text, flags=re.M)              # разметку Markdown — в простой текст
     text = re.sub(r"^\s*[-*•]\s+", "• ", text, flags=re.M)
     items = ctx.get("items") or []
-    used = []
-
-    def ref(m):
-        n = int(m.group(1))
-        if 1 <= n <= len(items):
-            if n not in used:
-                used.append(n)
-            return f"[{n}]"
-        return ""
-    text = re.sub(r"\[(\d{1,2})\]", ref, text)
+    cited = r"\[(\d{1,2})\]"
+    text = re.sub(cited, lambda m: f"[{int(m[1])}]" if 1 <= int(m[1]) <= len(items) else "", text)
     text = re.sub(r"[ \t]+([.,;:])", r"\1", text).strip()
     text = structure_answer(text)
-    return {"text": text[:3000], "refs": [{"n": n, "id": items[n - 1]["id"], "title": items[n - 1]["title"], "url": items[n - 1].get("url"),
+    if len(text) > max_length:
+        text = re.sub(r"\[\d{0,2}$", "", text[:max_length - 1].rstrip()).rstrip() + "…"
+    used = dict.fromkeys(map(int, re.findall(cited, text)))
+    return {"text": text, "refs": [{"n": n, "id": items[n - 1]["id"], "title": items[n - 1]["title"], "url": items[n - 1].get("url"),
                                            "source": items[n - 1].get("source")} for n in used]}
