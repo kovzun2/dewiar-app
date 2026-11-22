@@ -3,7 +3,7 @@
    Вкладки: «Пульс» (поле сигналов, бриф дня, тренды), «Лента», «Тренды», «Источники», «Разум», «Галактика», «Управление». */
 (function () {
   const T = (k, p) => window.t("insight." + k, p);
-  const RD = { tab: "pulse", d: {}, feed: { q: "", type: "", min: 0, sort: "new", watch: false }, tseg: "all", gal: null, galSel: -1, busy: false };
+  const RD = { tab: "pulse", d: {}, feed: { q: "", type: "", min: 0, sort: "new", watch: false }, tseg: "all", gal: null, galSel: -1, busy: false, turns: [] };
   const q = (s, el) => (el || document).querySelector(s);
   const qa = (s, el) => [...(el || document).querySelectorAll(s)];
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -78,9 +78,13 @@
   /* ---------- «Пульс» ---------- */
   function renderPulse(d) {
     const el = q("#rd-pulse");
+    if (RD.mission !== d.mission) {
+      RD.mission = d.mission; RD.ans = null; RD.turns = [];
+    }
     chips(d.stats);
     if (!d.stats.sources_all) {
-      el.innerHTML = empty(T("empty.title"), T("empty.text"), T("empty.btn")); bindGo(el); return;
+      el.innerHTML = empty(T("empty.title"), T("empty.text"), T("empty.btn")) + (d.expert?.cases ? askCard([], d.expert) : "");
+      bindGo(el); bindAsk(el); return;
     }
     const b = d.brief && d.brief.headline ? d.brief : null;
     const tr = d.trends || [];
@@ -93,7 +97,7 @@
             <b><a href="#" ${m.id ? `data-rid="${esc(m.id)}"` : `data-url="${esc(m.url)}"`}>${esc(m.title)}</a></b><p>${esc(m.why_brief || m.summary)}</p></div></div>`).join("")}</div>` : ""}`
           : `<div class="rd-empty"><b>${esc(T("brief.none"))}</b>${esc(T("brief.none.t"))}<div style="margin-top:14px"><button class="btn rd-btn" id="rd-mkbrief">${esc(T("brief.make"))}</button></div></div>`}
         </div>
-        <div class="rd-side">${askCard(tr)}<div class="rd-card"><h3>${esc(T("trends"))} <small><a href="#" data-go="trends">${esc(T("all"))}</a></small></h3>
+        <div class="rd-side">${askCard(tr, d.expert)}<div class="rd-card"><h3>${esc(T("trends"))} <small><a href="#" data-go="trends">${esc(T("all"))}</a></small></h3>
           ${tr.length ? tr.map(t => `<div class="rd-trend-row" data-tq="${esc(t.name)}"><div><b>${esc(t.name)}</b><small class="rd-st-${t.status}">${esc(stText(t.status))}</small>
             <small> · ${esc(T("srcs", { n: t.sources }))}</small></div>${spark(t.spark, stColor(t.status))}<span class="v">${t.day}</span></div>`).join("")
             : `<p class="rd-hint">${esc(T("trends.none"))}</p>`}</div></div>
@@ -106,17 +110,29 @@
     drawField(d.field || []);
   }
 
-  /* «Спросите Лиру о теме» — прямо в «Пульсе» (владелец 12.11: строка «Спросите аналитика…» внизу была непонятной и
-     неудобной): поле с кнопкой, три готовых вопроса из данных, ответ здесь же — по разобранному, со ссылками [n]. */
+  /* В «Пульсе» храним несколько реплик для уточнений. Ответ и источники остаются под полем вопроса. */
   const IC_SEND = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h13M13 6l6 6-6 6"/></svg>';
-  function askCard(tr) {
+  function progress(expert) {
+    if (!expert || !expert.studied) return T("expert.waiting");
+    return T("expert.progress", { n: fmt(expert.studied), c: fmt(expert.cases), t: ago(expert.last) });
+  }
+  function askCard(tr, expert) {
     const up = (tr || []).find(t => t.status === "up" || t.status === "new");
     const sug = [T("ask.s1"), up ? T("ask.s2", { t: up.name }) : T("ask.s2b"), T("ask.s3")];
-    return `<div class="rd-card rd-askc"><h3>${esc(T("ask.title"))}</h3><p class="rd-hint">${esc(T("ask.hint"))}</p>
+    return `<div class="rd-card rd-askc"><h3>${esc(expert?.name || T("ask.title"))}</h3><p class="rd-hint">${esc(T("ask.hint"))}</p>
+      ${expert ? `<p class="rd-hint">${esc(RD.mission ? progress(expert) : T("expert.no_mission"))}
+        <button class="rd-achat" data-go="mind" type="button">${esc(T("expert.memory"))}</button></p>` : ""}
       <form class="rd-askf" id="rd-askf"><input type="text" id="rd-ask-q" maxlength="500" placeholder="${esc(T("ask.ph"))}" aria-label="${esc(T("ask.title"))}">
         <button class="btn primary" type="submit" title="${esc(T("ask.btn"))}" aria-label="${esc(T("ask.btn"))}">${IC_SEND}</button></form>
       <div class="rd-sugg">${sug.map(x => `<button type="button" class="rd-sg">${esc(x)}</button>`).join("")}</div>
+      <div id="rd-ask-history">${historyHtml()}</div>
       <div class="rd-ans" id="rd-ans" aria-live="polite">${RD.ans ? ansHtml(RD.ans) : ""}</div></div>`;
+  }
+  function historyHtml() {
+    if (!RD.turns.length) return "";
+    return `<details class="rd-ask-history"><summary>${esc(T("expert.history"))}</summary>${RD.turns.map(a =>
+      `<div class="rd-aq">${esc(a.q)}</div><p>${esc(a.text)}</p>${(a.refs || []).map(r =>
+        `<a href="#" data-url="${esc(r.url)}">${esc(r.title)}</a>`).join(" · ")}`).join("")}</details>`;
   }
   function ansHtml(a) {
     if (a.wait) return `<div class="rd-wait"><i></i><i></i><i></i><span>${esc(T("ask.wait"))}</span></div>`;
@@ -136,27 +152,38 @@
       else body += `<p${i === 0 ? ' class="rd-alead"' : ""}>${refs(x)}</p>`;
     });
     flush();
-    return `<div class="rd-aq">${esc(a.q)}</div><div class="rd-at">${body}</div>
+    return `<div class="rd-aq">${esc(a.q)}</div>${a.expert ? `<small class="rd-expert-name">${esc(a.expert)}</small>` : ""}<div class="rd-at">${body}</div>
       ${(a.refs || []).length ? `<ol class="rd-arefs">${a.refs.map(r => `<li value="${r.n}"><a href="#" data-url="${esc(r.url)}">${esc(r.title)}</a> <small>${esc(r.source || "")}</small></li>`).join("")}</ol>` : ""}
       <button type="button" class="rd-achat" id="rd-achat">${esc(T("ask.chat"))}</button>`;
   }
-  async function askNow(v) {
+  async function askNow(v, expert = true) {
     v = String(v || "").trim(); if (!v || (RD.ans && RD.ans.wait)) return;
     const box = () => q("#rd-ans");
-    RD.ans = { q: v, wait: true }; if (box()) box().innerHTML = ansHtml(RD.ans);
-    try { RD.ans = Object.assign({ q: v }, await call("insight_question", { q: v })); }
-    catch (e) { RD.ans = { q: v, err: e.message || String(e) }; }
+    if (RD.ans?.text && RD.ans.expert) RD.turns = [...RD.turns, RD.ans].slice(-3);
+    const history = q("#rd-ask-history");
+    if (history) { history.innerHTML = historyHtml(); bindAnswerLinks(history); }
+    const pending = RD.ans = { q: v, wait: true };
+    if (box()) box().innerHTML = ansHtml(pending);
+    let answer;
+    try { answer = await call("insight_question", expert ? { q: v, expert, history: RD.turns.map(a => ({ q: a.q, a: a.text })) } : { q: v }); }
+    catch (e) { answer = { err: e.message || String(e) }; }
+    if (RD.ans !== pending) return;
+    RD.ans = { q: v, ...answer };
     if (box()) { box().innerHTML = ansHtml(RD.ans); bindAns(box()); }
   }
-  function bindAns(b) {
+  function bindAnswerLinks(b) {
     qa("[data-url]", b).forEach(a => a.onclick = (e) => { e.preventDefault(); openUrl(a.dataset.url); });
+  }
+  function bindAns(b) {
+    bindAnswerLinks(b);
     qa("[data-ref]", b).forEach(a => a.onclick = (e) => { e.preventDefault(); const r = (RD.ans.refs || []).find(x => String(x.n) === a.dataset.ref); if (r) { if (r.id) rdRead(r.id); else openUrl(r.url); } });
-    const c = q("#rd-achat", b); if (c) c.onclick = () => { const v = T("ask.prefix") + " " + RD.ans.q; if (typeof qaAsk === "function") qaAsk(v); else core.call("say", { text: v }).catch(() => {}); };
+    const c = q("#rd-achat", b); if (c) c.onclick = () => { const v = T(RD.ans.expert ? "expert.ask_prefix" : "ask.prefix") + " " + RD.ans.q; if (typeof qaAsk === "function") qaAsk(v); else core.call("say", { text: v }).catch(() => {}); };
   }
   function bindAsk(el) {
     const f = q("#rd-askf", el); if (!f) return;
     f.onsubmit = (e) => { e.preventDefault(); const i = q("#rd-ask-q"); const v = i.value.trim(); if (!v) { i.focus(); return; } i.value = ""; askNow(v); };
     qa(".rd-sg", el).forEach(b => b.onclick = () => askNow(b.textContent));
+    bindAnswerLinks(q("#rd-ask-history", el));
     bindAns(q("#rd-ans", el));
   }
 
@@ -347,6 +374,17 @@
   }
 
   /* ---------- «Разум» ---------- */
+  function expertCard(expert) {
+    const recent = expert.recent || [];
+    const date = (x) => x.ts ? new Date(x.ts * 1000).toLocaleDateString(loc())
+      : T("expert.studied_at", { d: new Date(x.at * 1000).toLocaleDateString(loc()) });
+    return `<div class="rd-card"><h3>${esc(expert.name)} <small>${esc(T("expert.memory"))}</small></h3>
+      <p class="rd-hint">${esc(progress(expert))}</p>
+      <button class="btn rd-btn" id="rd-expert-name" type="button">${esc(T("expert.rename"))}</button>
+      ${recent.map(x => `<div class="rd-thesis"><a href="#" data-url="${esc(x.url)}">${esc(x.title)}</a>
+        <small>${esc([x.source, date(x)].filter(Boolean).join(" · "))}</small>
+        <ul>${x.findings.map(f => `<li>${esc(f.quote)}</li>`).join("")}</ul></div>`).join("")}</div>`;
+  }
   async function renderMind() {
     const el = q("#rd-mind");
     let d; try { d = await call("insight_mind"); } catch (e) { toast(e.message); return; }
@@ -373,13 +411,18 @@
           <circle cx="36" cy="36" r="30" stroke="${P.c1hex}" stroke-width="6" fill="none" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C * (1 - (rate || 0) / 100)}" transform="rotate(-90 36 36)"/></svg>
           <div><b>${rate == null ? "—" : rate + "%"}</b><small>${esc(accLine)}</small></div></div>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn primary rd-btn" id="rd-evo">${esc(T("mind.evolve"))}</button><small style="color:var(--dim)">${esc(T("mind.evolve.t"))}</small></div></div></div></div>
-      <div class="rd-mgrid"><div class="rd-card"><h3>${esc(T("mind.theses"))} <small>${esc(T("mind.n", { n: (d.theses || []).length }))}</small></h3>
+      <div class="rd-mgrid">${d.expert ? expertCard(d.expert) : ""}<div class="rd-card"><h3>${esc(T("mind.theses"))} <small>${esc(T("mind.n", { n: (d.theses || []).length }))}</small></h3>
           ${(d.theses || []).length ? d.theses.map(t => `<div class="rd-thesis">${esc(t.text)}<small>${t.refs.map(r => `<a href="#" data-url="${esc(r.url)}">${esc(r.title.slice(0, 60))}</a>`).join(" · ")}</small></div>`).join("") : `<p class="rd-hint">${esc(T("mind.theses.none"))}</p>`}</div>
         <div class="rd-card"><h3>${esc(T("mind.hyps"))} <small>${esc(T("mind.open", { n: open.length }))}</small></h3>
           ${(d.hyps || []).length ? d.hyps.slice().reverse().slice(0, 12).map(h => `<div class="rd-hyp"><span class="${h.state === "confirmed" ? "ok" : h.state === "refuted" ? "no" : ""}">${h.state === "confirmed" ? "✓" : h.state === "refuted" ? "✕" : "·"}</span><div>${esc(h.text)} <small>${h.due ? esc(T("mind.due", { d: h.due })) : ""}</small></div></div>`).join("") : `<p class="rd-hint">${esc(T("mind.hyps.none"))}</p>`}</div>
         <div class="rd-card"><h3>${esc(T("mind.watch"))}</h3>${(d.watch || []).length ? `<div class="rd-items">${d.watch.slice(0, 6).map(itemHtml).join("")}</div>` : `<p class="rd-hint">${esc(T("mind.watch.none"))}</p>`}</div>
         <div class="rd-card"><h3>${esc(T("mind.diary"))}</h3>${(d.diary || []).length ? `<div class="rd-diary">${d.diary.map(x => `<div>${esc(T("mind.diary.row", { v: x.v, t: ago(x.at), th: x.theses, h: x.new_hyps, c: x.closed }))}</div>`).join("")}</div>` : `<p class="rd-hint">${esc(T("mind.diary.none"))}</p>`}</div></div>`;
     qa("[data-url]", el).forEach(a => a.onclick = (e) => { e.preventDefault(); openUrl(a.dataset.url); });
+    const name = q("#rd-expert-name", el);
+    if (name) name.onclick = async () => {
+      const v = await askText(T("expert.rename"), d.expert.name, { ok: T("save") }); if (v == null) return;
+      try { await call("insight_expert_name", { name: v }); toast(T("saved")); renderMind(); } catch (e) { toast(e.message); }
+    };
     q("#rd-misb").onclick = async () => {
       const v = await askText(T("mind.mission.ask"), d.mission || "", { ok: T("save") }); if (v == null) return;
       try { await call("insight_mission", { text: v }); toast(T("saved")); renderMind(); } catch (e) { toast(e.message); } };
@@ -559,7 +602,7 @@
   function rrBind(d, x) {
     q("#rr-x", d).onclick = rrClose;
     const o = q("#rr-open", d); if (o) o.onclick = () => openUrl(x.url);
-    q("#rr-ask", d).onclick = () => { rrClose(); const v = T("read.q", { title: x.title }); if (RD.tab !== "pulse") { tab("pulse"); setTimeout(() => askNow(v), 450); } else askNow(v);
+    q("#rr-ask", d).onclick = () => { rrClose(); const v = T("read.q", { title: x.title }); if (RD.tab !== "pulse") { tab("pulse"); setTimeout(() => askNow(v, false), 450); } else askNow(v, false);
       setTimeout(() => { const a = q("#rd-ans"); if (a) a.scrollIntoView({ block: "center", behavior: REDUCE.matches ? "auto" : "smooth" }); }, 500); };
     const w = q("#rr-watch", d); w.onclick = async () => { const on = !w.classList.contains("on"); await call("insight_mark", { id: x.id, watch: on }).catch(() => {});
       x.watch = on; w.classList.toggle("on", on); w.setAttribute("aria-pressed", String(on)); w.textContent = (on ? "★ " : "☆ ") + T("watch"); };
@@ -607,7 +650,7 @@
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k" && q("#p-insight").classList.contains("cur")) {
       e.preventDefault(); const go = () => { const i = q("#rd-ask-q"); if (i) i.focus(); }; if (RD.tab !== "pulse") { tab("pulse"); setTimeout(go, 400); } else go(); }
   });
-  core.on("insight", () => { if (q("#p-insight").classList.contains("cur") && (RD.tab === "pulse" || RD.tab === "feed")) load(); });
+  core.on("insight", () => { if (q("#p-insight").classList.contains("cur") && ["pulse", "feed", "mind"].includes(RD.tab)) load(); });
   // 15.11 (владелец, Ubuntu: «перешёл по ссылке из виджета — „Пульс“ пустой, помогает „Лента“ и обратно»): студия открылась
   // прямо на «Радаре» раньше, чем связалась с ядром, — load() молча вышел; связь появилась — загружаем то, что открыто
   core.on("hello", () => { if (q("#p-insight").classList.contains("cur")) load(); });

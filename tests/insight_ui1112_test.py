@@ -80,6 +80,11 @@ eng.insight = EI.Radar(eng, tmp / "s")
 eng.insight._ask = lambda system, user, max_tokens=700: "Главное за неделю — утечка исходников PHP [1] и дешёвые GPU [2]."
 R = {"insight_question": EI.command(eng, "insight_question", {"q": "Что главное за неделю?"})}
 R.update({c: EI.command(eng, c, {}) for c in ("insight_pulse", "insight_feed", "insight_trends", "insight_sources", "insight_mind", "insight_galaxy", "insight_control")})
+R["insight_pulse"]["expert"] = {"name": "Мира", "studied": 7, "cases": 1, "last": int(now)}
+R["insight_mind"]["expert"] = dict(R["insight_pulse"]["expert"], recent=[{
+    "title": "Кейс проекта", "source": "Пример", "url": "https://example.org/case", "ts": int(now),
+    "findings": [{"subject": "Пример", "kind": "revenue", "quote": "Мы заработали $1 200 за июнь."}],
+}])
 from playwright.sync_api import sync_playwright
 EMPTY = {"insight_pulse": {"stats": dict(R["insight_pulse"]["stats"], sources_all=0, sources=0), "brief": None, "field": [], "trends": [], "week": 0, "mission": ""}}
 
@@ -87,7 +92,9 @@ EMPTY = {"insight_pulse": {"stats": dict(R["insight_pulse"]["stats"], sources_al
 def run(lang, data):
     core = """(() => { const R = %s; const ready = () => { if (!window.core) return setTimeout(ready, 5);
     core.retry = () => {}; core.connect = () => {}; if (core.ws) { core.ws.onclose = null; core.ws.onerror = null; try { core.ws.close(); } catch (e) {} }
-    core.connected = true; core.call = async (c, a) => (c in R ? R[c] : null); }; ready(); })();""" % json.dumps(data, ensure_ascii=False)
+    window.radarQuestions = []; core.connected = true; core.call = async (c, a) => { if (c === 'insight_question') {
+      radarQuestions.push(a); if (a.expert && R.insight_question) return { ...R.insight_question, expert: R.insight_pulse?.expert?.name }; }
+    return c in R ? R[c] : null; }; }; ready(); })();""" % json.dumps(data, ensure_ascii=False)
     out = {}
     with sync_playwright() as p:
         b = p.chromium.launch(); errs = []
@@ -116,6 +123,13 @@ def run(lang, data):
         pg.evaluate("document.querySelector('.rd-sg') && document.querySelector('.rd-sg').click()"); pg.wait_for_timeout(500)
         out["ans"] = pg.evaluate("(document.querySelector('#rd-ans') || {}).innerText || ''")
         out["refs"] = pg.evaluate("document.querySelectorAll('#rd-ans .rd-ref').length")
+        if data is R:
+            pg.evaluate("window.qaAsk = q => { window.radarDial = q; }")
+            pg.click("#rd-achat")
+            out["callExpert"] = pg.evaluate("window.radarDial")
+            pg.fill("#rd-ask-q", "Какие риски?"); pg.press("#rd-ask-q", "Enter")
+            pg.wait_for_function("radarQuestions.length === 2")
+            out["followup"] = pg.evaluate("radarQuestions[1]")
         out["askbar"] = pg.evaluate("!!document.querySelector('form.rd-ask')")
         out["head"] = pg.evaluate("document.querySelector('#rd-room').innerText")
         out["errs"] = [e for e in errs if "insight" in e]
@@ -123,8 +137,10 @@ def run(lang, data):
     return out
 
 
+results = {}
 for lang in ("ru", "en"):
     o = run(lang, R)
+    results[lang] = o
     ok(not o["errs"], f"{lang}: страница без ошибок: {o['errs'][:2]}")
     raw = [t for t, v in o.items() if isinstance(v, str) and "insight." in v]
     ok(not raw, f"{lang}: нет сырых ключей словаря (вкладки {raw})")
@@ -133,16 +149,22 @@ for lang in ("ru", "en"):
        f"{lang}: сильнейшие за неделю — списком под полем: {o['tops_lab']!r} {o['tops'][:1]}")
     ok(o["fq"] == "утечка php", f"{lang}: №670 — поиск в «Ленте» не съедает пробел: {o['fq']!r}")
     ok(("Утечка исходников движка PHP" in o["feed"]) and ("habr.com" in o["sources"]), f"{lang}: лента и источники — из данных ядра")
-ru, en = run("ru", R), run("en", R)
+ru, en = results["ru"], results["en"]
 ok("Поле сигналов" in ru["pulse"] and "Signal field" in en["pulse"] and "Галактика" in ru["head"] and "Galaxy" in en["head"], "русский и английский — свои подписи")
 ok("Радар · бриф дня" in ru["home"] and "Разблокировка GPU" in ru["home"] and "⚡ 9,4" in ru["home"], f"«Главная»: бриф дня и сильный сигнал: {ru['home']!r}")
 ok("Radar · daily brief" in en["home"] and "⚡ 9.4" in en["home"], f"Home in English: {en['home']!r}")
 ok("Главное за неделю" in ru["ans"] and ru["refs"] == 2 and ru["ans"].count("Материал") + ru["ans"].count("Утечка") >= 2 and not ru["askbar"],
    f"«Спросите Лиру о теме»: готовый вопрос — ответ здесь же, ссылки на материалы; старой строки внизу нет: {ru['ans'][:120]!r}")
 ok("Continue in chat" in en["ans"], "ответ и по-английски — с переходом в чат")
+ok("Мира" in ru["pulse"] and "$1 200 за июнь" in ru["mind"], "профиль и изученные кейсы видны в Студии")
+ok((ru["callExpert"] or "").startswith("Спроси эксперта Радара"), "из Студии вопрос эксперту передаётся в чат Лиры")
+ok(ru["followup"].get("expert") and (ru["followup"].get("history") or [{}])[0].get("q"),
+   "уточнение передаётся эксперту с предыдущим вопросом и ответом")
 e = run("ru", EMPTY)
 ok(not e["home"], "источников нет — карточки Радара на «Главной» нет")
 ok("Радар пока пуст" in e["pulse"] and "Добавить источники" in e["pulse"], f"пустой Радар — приглашение добавить источники: {e['pulse'][:80]!r}")
+archive = dict(R, insight_pulse=dict(EMPTY["insight_pulse"], expert=R["insight_pulse"]["expert"], mission=R["insight_pulse"]["mission"]))
+ok("Главное за неделю" in run("ru", archive)["ans"], "накопленные кейсы остаются доступны, когда убран последний источник")
 # №958 (22.11: «всегда 0 подтвердились, 0 нет — кнопка не работает»): пока ни один прогноз не дошёл до срока — честно, сколько
 # ждут и когда ближайший, а не «0 и 0»
 m0 = dict(R["insight_mind"], accuracy={"confirmed": 0, "refuted": 0, "rate": None},

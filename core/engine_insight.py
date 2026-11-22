@@ -1,18 +1,20 @@
 """«Радар» в движке (docs/RADAR.md): сеть, модель, расписание, команды студии и инструмент модели insight_ask.
 Чистая часть — core/insight.py. Один объект на движок: eng.insight (Radar), поток — eng.insight.loop()."""
 import logging
+import re
 import threading
 import time
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import insight as I
+import insight_expert as Expert
 
 log = logging.getLogger("dewiar.engine")
 
 DEFAULTS = {"on": True, "mission": "", "daily_max": I.DAILY_MAX, "urgent_min": I.URGENT_MIN, "mode": "always",
             "night": [1, 7], "tick_day": 20, "tick_night": 5, "per_tick_day": 5, "per_tick_night": 25, "day_long": False,
-            "every_day": 180, "every_night": 60, "brief_hour": 7, "setup_at": 0}
+            "every_day": 180, "every_night": 60, "brief_hour": 7, "setup_at": 0, "expert_name": ""}
 
 
 class Radar:
@@ -23,6 +25,7 @@ class Radar:
         self.lock = threading.Lock()                 # один такт за раз
         self.running = None                          # что делается сейчас ({k, x} — студия переводит)
         self.fetch = self._http                     # подменяют проверки
+        self.fetch_study = self._study_http
         self._reads = {}                            # «читалка»: прочитанные целиком — до 30 последних
 
     # ---------- настройки ----------
@@ -53,6 +56,7 @@ class Radar:
         if not src and not c.get("mission"):
             return None
         return {"at": self._setup_at(c, src), "mission": c.get("mission") or "", "on": c.get("on") is not False,
+                "expert_name": c.get("expert_name") or "",
                 "sources": [{"url": s["url"], "on": s.get("on") is not False} for s in src][:300]}
 
     def setup_apply(self, d):
@@ -71,7 +75,10 @@ class Radar:
                 self.st.remove_source(s["id"])
             elif bool(want[k].get("on", True)) != (s.get("on") is not False):
                 self.st.update_source(s["id"], on=bool(want[k].get("on", True)))
-        self.set_conf({"mission": str(d.get("mission") or "")[:600], "on": d.get("on") is not False, "setup_at": at})
+        patch = {"mission": str(d.get("mission") or "")[:600], "on": d.get("on") is not False, "setup_at": at}
+        if "expert_name" in d:
+            patch["expert_name"] = str(d.get("expert_name") or "")[:60]
+        self.set_conf(patch)
         try:
             self.e.emit("insight", what="sources")
         except Exception:  # noqa: BLE001
@@ -105,6 +112,13 @@ class Radar:
                 raise
             log.info("📡 Радар: %s — напрямую не открылся (%s), прочитан через сервер Dewiar", url, type(e).__name__)
             return html
+
+    def _study_http(self, url):
+        # Ссылки из лент чужие. Проверяем каждый переход так же, как при чтении страниц для подкаста.
+        import httpx
+        from podcast_base import safe_get
+        media_type, data, _ = safe_get(url, limit=1_500_000)
+        return httpx.Response(200, headers={"content-type": media_type}, content=data).text
 
     def _cloud(self, params):
         """GET к cloud.php с входом человека -> JSON или None (нет входа, запасной путь выключен, сервер не ответил)."""
@@ -164,7 +178,7 @@ class Radar:
             if src.get("last"):
                 return 0                                         # одна статья читается один раз
             title, text = I.article_text(self.fetch(src["url"]))
-            found = [{"title": title or src["url"], "url": src["url"], "ts": int(time.time()), "text": text}]
+            found = [{"title": title or src["url"], "url": src["url"], "text": text}]
         else:
             if not feed:
                 page = self.fetch(src["url"])
@@ -238,20 +252,59 @@ class Radar:
         done = sum(w[:now.hour]) + w[now.hour] * (now.minute / 60) + w[now.hour]
         return min(dm, math.ceil(dm * done / sum(w)))
 
+    def _analyze_item(self, item, mission, *, article=None):
+        lang = self.lang()
+        if not mission:
+            return I.parse_analysis(self._ask(*I.analyze_prompt(mission, item, lang)))
+        text = item.get("text") or ""
+        partial = False
+        if article is None and not item.get("video") and item.get("kind") not in ("telegram", "vk"):
+            try:
+                url = item.get("url") or ""
+                if urlparse(url).scheme in ("http", "https"):
+                    _, article = I.article_text(self.fetch_study(url), Expert.TEXT_MAX)
+                    partial = not article
+            except Exception as e:  # noqa: BLE001
+                partial = True
+                log.info("📡 Радар: эксперт читает выдержку, страница недоступна: %s", e)
+        if len(article or "") > len(text):
+            text = article
+        text = text[:Expert.TEXT_MAX]
+        raw = self._ask(*Expert.study_prompt(mission, dict(item, text=text), lang), max_tokens=1400)
+        analysis = I.parse_analysis(raw)
+        if analysis:
+            Expert.remember(self.st, mission, item, analysis, Expert.verified_findings(raw, text), partial=partial)
+        return analysis
+
     def analyze(self, limit, paced=True):
         cap = self.paced() if paced else int(self.conf()["daily_max"])
         left = max(0, min(cap, int(self.conf()["daily_max"])) - self.used_today())
+        size = min(limit, left)
+        mission = self.conf()["mission"]
+        long_ok = self.night() or self.conf().get("day_long")
+        queue = self.st.queue(size, long_ok=long_ok)
+        if mission and size:
+            known = self.st.load(Expert.memory_key(mission), {})
+            now = time.time()
+            finished = {iid for iid, row in known.items() if row.get("retry_at", now + 1) > now}
+            previous = [x for x in self.analyzed() if x["id"] not in finished and not x.get("fail")
+                        and (long_ok or not x.get("video"))]
+            if previous:
+                # Один старый материал изучаем даже при полной очереди, если есть место и для свежих.
+                reserve = min(2, size - len(queue)) or int(size > 1)
+                queue = queue[:size - reserve] + sorted(previous, key=lambda x: -(x.get("ts") or 0))[:reserve]
         n = 0
-        for x in self.st.queue(min(limit, left), long_ok=self.night() or self.conf().get("day_long")):
+        for x in queue:
             self.running = {"k": "analyze", "x": x["title"][:50]}
             try:
-                a = I.parse_analysis(self._ask(*I.analyze_prompt(self.conf()["mission"], x, self.lang())))
+                a = self._analyze_item(x, mission)
             except Exception as e:  # noqa: BLE001
                 log.info("📡 Радар: разбор не удался: %s", e)
                 if "модел" in str(e):
                     break
                 a = None
-            self.st.set_analysis(x["id"], a, fail="" if a else "модель не ответила по форме")
+            if not x.get("a"):
+                self.st.set_analysis(x["id"], a, fail="" if a else "модель не ответила по форме")
             n += 1
         if n:
             self._count(n)
@@ -471,7 +524,22 @@ class Radar:
         main = [dict(self.item_view(byid[m["id"]]), why_brief=m["why"]) for m in b.get("main") or [] if m["id"] in byid]
         return {"stats": self.stats(), "brief": dict(b, main=main) if b else None, "field": I.field(items, time.time()),
                 "trends": tr[:10], "week": len([x for x in items if (x.get("ts") or 0) >= time.time() - 7 * 86400]),
-                "mission": self.conf()["mission"]}
+                "mission": self.conf()["mission"], "expert": self.expert_profile()}
+
+    def expert_name(self):
+        return self.conf().get("expert_name") or ("Radar expert" if self.lang().startswith("en") else "Эксперт Радара")
+
+    def expert_address(self, text):
+        name = self.conf().get("expert_name")
+        # Распознавание речи не всегда ставит запятую между именем и вопросом.
+        address = r"(?:\s*[,:—]|\s+(?:как|что|предложи|подскажи|what|how|suggest)\b)"
+        if name and re.match(rf"^\s*@?{re.escape(name)}{address}", text or "", re.IGNORECASE):
+            return name
+        return ""
+
+    def expert_profile(self, *, recent=False):
+        rows = Expert.records(self.st, self.conf()["mission"], self.st.items())
+        return Expert.profile(self.expert_name(), rows, recent=recent)
 
     def mind_view(self):
         m, gone = I.clean_hyps(self.st.load("mind", {}))
@@ -482,7 +550,8 @@ class Radar:
               for t in m.get("theses") or []]
         watch = [self.item_view(x) for x in self.st.items() if x.get("watch")][:20]
         return {"mission": self.conf()["mission"], "v": m.get("v", 0), "theses": th, "hyps": m.get("hyps") or [],
-                "diary": list(reversed(m.get("diary") or []))[:20], "accuracy": I.accuracy(m), "watch": watch}
+                "diary": list(reversed(m.get("diary") or []))[:20], "accuracy": I.accuracy(m), "watch": watch,
+                "expert": self.expert_profile(recent=True)}
 
     def read(self, iid):
         """«Читалка» (владелец 12.11: «статья интересная, а не сразу удаётся её найти»): материал и его текст целиком —
@@ -515,12 +584,12 @@ class Radar:
         d = I.detect(url)
         if not d:
             raise ValueError("это не похоже на ссылку")
-        title, text = I.article_text(self.fetch(d["url"]))
+        title, text = I.article_text(self.fetch(d["url"]), Expert.TEXT_MAX)
         src = {"id": "one", "name": d.get("name") or "ссылка", "kind": "article"}
-        self.st.add_items(src, [{"title": title or d["url"], "url": d["url"], "ts": int(time.time()), "text": text}])
+        self.st.add_items(src, [{"title": title or d["url"], "url": d["url"], "text": text}])
         x = next((y for y in self.st.items() if I.norm_link(y.get("url")) == I.norm_link(d["url"])), None)
         if x and not x.get("a"):
-            a = I.parse_analysis(self._ask(*I.analyze_prompt(self.conf()["mission"], x, self.lang())))
+            a = self._analyze_item(x, self.conf()["mission"], article=text)
             self.st.set_analysis(x["id"], a, fail="" if a else "модель не ответила по форме")
             self._count(1)
             x = next((y for y in self.st.items() if y["id"] == x["id"]), x)
@@ -580,7 +649,7 @@ def command(eng, cmd, a):
             return {"sources": r.sources_view(), "found": int(s.get("found") or 0), "new": n}
         return {"sources": r.sources_view()}
     if cmd == "insight_question":
-        return question(eng, a.get("q"))
+        return question(eng, a.get("q"), expert=a.get("expert") is True, history=a.get("history"))
     if cmd == "insight_read":
         return {"item": r.read(str(a.get("id") or ""))}
     if cmd == "insight_one":
@@ -594,6 +663,10 @@ def command(eng, cmd, a):
         r.set_conf({"mission": str(a.get("text") or "").strip()[:600]})
         r.setup_touch()
         return r.mind_view()
+    if cmd == "insight_expert_name":
+        r.set_conf({"expert_name": " ".join(str(a.get("name") or "").split())[:60]})
+        r.setup_touch()
+        return r.expert_profile(recent=True)
     if cmd == "insight_evolve":
         _bg(r.evolve)
         return {"started": True}
@@ -604,6 +677,7 @@ def command(eng, cmd, a):
         kw = {}
         if "fb" in a:
             kw["fb"] = max(-1, min(1, int(a["fb"])))
+            Expert.mark(r.st, iid, kw["fb"])
         if "watch" in a:
             kw["watch"] = bool(a["watch"])
         r.st.mark(iid, **kw)
@@ -618,23 +692,43 @@ def command(eng, cmd, a):
     raise ValueError("неизвестная команда радара")
 
 
-def question(eng, q):
-    """«Спросите Лиру о теме» в самом «Радаре»: ответ по разобранному (по словам вопроса, иначе — самое сильное) со ссылками."""
+def question(eng, q, *, expert=False, history=None):
+    """Ответ со ссылками из памяти эксперта или из обычной подборки материалов Радара."""
     r = radar(eng)
     q = str(q or "").strip()[:500]
     if not q:
         raise ValueError("пустой вопрос")
-    ctx = ask_tool(eng, q)
-    if ctx.get("empty"):
-        return {"text": ctx["empty"], "refs": []}
-    if not ctx["items"]:                               # слов вопроса в материалах нет — отвечаем по самому сильному
-        ctx = ask_tool(eng, "")
-    if not ctx["items"] and not ctx.get("brief"):
-        raise ValueError("Радар ещё ничего не разобрал — загляните после первого обхода")
-    raw = r._ask(*I.question_prompt(q, ctx, r.conf()["mission"], r.lang()), max_tokens=700)
+    mission = r.conf()["mission"]
+    lang = r.lang()
+    name, turns = "", []
+    if expert:
+        name = r.expert_name()
+        items = r.st.items()
+        rows = Expert.records(r.st, mission, items)
+        turns = [{"q": str(turn.get("q") or "")[:500], "a": str(turn.get("a") or "")[:1000]}
+                 for turn in (history[-3:] if isinstance(history, list) else []) if isinstance(turn, dict)]
+        search = q + (" " + turns[-1]["q"] if turns else "")
+        ctx = Expert.answer_context(rows, items, search, mission, lang)
+        if not ctx["items"]:
+            text = ("I need more evidence for this field. Set a mission in Mind and add sources with detailed cases."
+                    if lang.startswith("en") else
+                    "Мне пока не хватает данных по этой теме. Укажите нишу в «Разуме» и добавьте источники с подробными кейсами.")
+            return {"expert": name, "text": text, "refs": []}
+    else:
+        ctx = ask_tool(eng, q)
+        if ctx.get("empty"):
+            return {"text": ctx["empty"], "refs": []}
+        if not ctx["items"]:
+            ctx = ask_tool(eng, "")
+        if not ctx.get("items") and not ctx.get("brief"):
+            raise ValueError("Радар ещё ничего не разобрал — загляните после первого обхода")
+    raw = r._ask(*I.question_prompt(q, ctx, mission, lang, expert=name, history=turns),
+                 max_tokens=950 if expert else 700)
     out = I.parse_answer(raw, ctx)
     if not out["text"]:
         raise ValueError("модель не ответила — попробуйте ещё раз")
+    if name:
+        out["expert"] = name
     return out
 
 
