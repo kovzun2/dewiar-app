@@ -406,7 +406,11 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                 log.info("🎨 Творческая просьба — температура %.2f", temp)
             # харнесс, шаг 1 (15.11): к вопросу — ядро действий и только нужные модули (Toolbox.specs(text)); прочее модель
             # попросит сама (more_tools) — вопрос легче вдвое: окно своей модели, свой ключ, очередь облака
-            slim_text = ask_core(text) + "\n" + "\n".join(
+            current_ask = ask_core(text)
+            expert_address = getattr(getattr(self, "insight", None), "expert_address", None)
+            expert = expert_address(current_ask) if expert_address else ""
+            routing_text = current_ask + ("\nРадар" if expert else "")
+            slim_text = routing_text + "\n" + "\n".join(
                 str(m.get("content") or "")[:300] for m in self.history[-4:] if m.get("role") == "user" and isinstance(m.get("content"), str))
             specs = self.toolbox.specs(slim_text) if self.s.get("tools", "enabled_all") is not False else []
             if specs and getattr(turn, "via_job", False) and "[Дело по расписанию]" in text:
@@ -431,7 +435,7 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
                 import modules as _mods
                 import talk_lean
                 # просьба к плагину (№507: «Когда ближайшее полнолуние?» — плагин «Луна») — дело, не беседа
-                if talk_lean.talk_turn(ask_core(text), self.history, _mods.wanted(ask_core(text))) and not self._plugin_hint(text):
+                if talk_lean.talk_turn(current_ask, self.history, _mods.wanted(routing_text)) and not self._plugin_hint(text):
                     specs, turn.lean = talk_lean.lean_specs(specs), True
                     log.info("🍃 Просто разговор — подсказка без правил действий (%d действия)", len(specs))
             mode = (self.s.get("llm", "tools_modes") or {}).get(self._tools_key(prof))
@@ -474,6 +478,8 @@ class AnswerMixin(PromptMixin, ModelsMixin, ReportMixin, DirectMixin, LookMixin)
             except Exception as e:  # noqa: BLE001
                 log.info("Поиск по записям: %s", e)
             ctx = [self._turn_context(text)] + ([pdelta] if pdelta else []) + [n.strip() for n in notes]   # меняющееся — в справку к вопросу, подсказка остаётся прежней
+            if expert and any(spec.get("name") == "insight_ask" for spec in specs):
+                ctx.append(f"Человек обращается к эксперту Радара по имени «{expert}». Передай вопрос в insight_ask с expert=true.")
             turn.read = read_mode(text, getattr(turn, "typed", False))
             if turn.read:
                 ctx.append(READ_HINT)                  # длинный разбор — для чтения: подзаголовки, жирное, списки

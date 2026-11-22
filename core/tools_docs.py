@@ -261,6 +261,8 @@ def t_insight_ask(a, ctx):
     if eng is None:
         raise ToolError("Радар работает в программе на компьютере")
     import engine_insight
+    if a.get("expert") is True:
+        return json.dumps(engine_insight.question(eng, a.get("query"), expert=True), ensure_ascii=False)
     return json.dumps(engine_insight.ask_tool(eng, str(a.get("query") or "")), ensure_ascii=False)[:9000]
 
 

@@ -228,6 +228,11 @@ html.st-neu .rd-mode.on small { color: var(--muted); }
 /* ---------- «Спросите Лиру о теме» — в «Пульсе», над трендами ---------- */
 .rd-side { display: grid; gap: 18px; align-content: start; min-width: 0; }
 .rd-askc h3 { margin-bottom: 4px; }
+.rd-expert-name, .rd-ask-history { color: var(--muted); }
+.rd-ask-history { margin-top: 12px; font-size: 13px; }
+.rd-ask-history summary { cursor: pointer; }
+.rd-ask-history p { white-space: pre-line; margin: 4px 0; }
+.rd-thesis ul { padding-inline-start: 18px; margin: 6px 0; }
 .rd-askf { display: flex; gap: 8px; align-items: center; }
 #p-insight .rd-askf input[type=text] { flex: 1; min-width: 0; width: auto; }
 .rd-askf .btn { flex: none; width: 44px; height: 42px; padding: 0; display: grid; place-items: center; border-radius: 13px; }
